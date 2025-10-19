@@ -1,0 +1,642 @@
+include:
+  - project: "pub/ci"
+    ref: "0.0.6"
+    file: "/templates/common/.ci_job_jwt.gitlab-ci.yml"
+
+# Секция с общими для всех задач и этапов переменными.
+variables:
+  # Версия Playwright
+  PLAYWRIGHT_IMAGE: ${BASE_IMAGE_REPO}/docker/playwright:v1.51.1
+
+  # URL Allure TestOps
+  ALLURE_ENDPOINT: https://allure.o3.ru
+
+
+  # ALLURE_PROJECT_ID это тот проект в Allure TestOps, куда будут загружаться отчёты.
+  # Айдишник можно найти в URL проекта:
+  # https://allure.o3.ru/project/1706/dashboards
+  ALLURE_PROJECT_ID: 505
+
+  # Токен для загрузки отчетов
+  ALLURE_TOKEN: 64b91e26-a1b0-43eb-afbd-a0a64bcc7fe6
+
+  # Это пространство имён, в котором существует репозиторий.
+  # Допустим, это репозиторий gitlab.ozon.ru/bx/shelf-api-ui-tests.
+  # От этого параметра могут зависеть какие-нибудь настройки среды выполнения.
+  K8S_NAMESPACE: orders
+
+  # Название сервиса (название репозитория)
+  SERVICE_NAME: orders
+
+  # Это сервис, который позволяет строить красивые отчёты.
+  # Подробная инструкция для подключения тут:
+  # https://confluence.o3.ru/display/QAKB/%5BTool%5D+QA+Report+Service
+  REPORT_SERVICE_HOST: http://qa-report-service.prod.a.o3.ru:80
+
+  # Папка с отчетам Аллюра
+  REPORT_PATH: allure-results
+
+  # Переменные для сообщения MM
+  MM_CI_PIPELINE_ID: $CI_PIPELINE_ID
+  MM_CI_PIPELINE_URL: $CI_PIPELINE_URL
+  MM_CI_COMMIT_AUTHOR: $CI_COMMIT_AUTHOR
+  MM_CI_COMMIT_REF_NAME: $CI_COMMIT_REF_NAME
+  MM_CI_COMMIT_MESSAGE: $CI_COMMIT_MESSAGE
+  MM_CI_COMMIT_SHORT_SHA: $CI_COMMIT_SHORT_SHA
+
+
+  ALLURE_PROJECT_NAME: gdz_orders
+  ALLURE_PROJECT_ID: 505
+  LAUNCH_NAME: "${CI_PROJECT_NAME} - ${CI_COMMIT_BRANCH} - ${CI_COMMIT_SHORT_SHA}"
+  MM_REPORT_NAME: gdz-orders-tests
+  SERVICE_HOST: orders-latest.gdz.svc.stg.k8s.o3.ru:82
+  PERSONS_TO_MENTION: "aagooshkov"
+
+# Cache modules using lock file
+cache:
+  key:
+    files:
+      - package-lock.json
+  paths:
+    - "**/node_modules/"
+  policy: pull # prevent subsequent jobs from modifying cache
+
+stages:
+  - .pre
+  - build
+  - orders
+  - budget
+  - archive
+  - supereconom2
+  - express
+  - .post
+# Мы не будем писать порядок выполнения этапов "stages",
+# поэтому у нас будут этапы по умолчанию
+# (подробнее https://docs.gitlab.com/13.12/ee/ci/yaml/README.html#stage):
+#  .pre
+#  build
+#  test
+#  deploy
+#  .post
+
+# Задача установки Node.js.
+install:
+  # Запускаем задачу на подготовительном этапе.
+  stage: .pre
+
+  except:
+    - api
+    - web
+    - schedules
+    - tags
+    - pipelines
+    - triggers
+
+  # Образ для Node.js
+  image: "${BASE_IMAGE_REPO}/docker/nodejs/base:18"
+
+  tags: [tests, k8s]
+
+  cache:
+    # Override policy to allow this job to update the cache at the end of the job
+    # and only update if it was a successful job
+    - key:
+        files:
+          - package-lock.json
+      paths:
+        - node_modules/
+      when: on_success
+      policy: pull-push
+
+    # store npm cache for all branches (stores download pkg.tar.gz's)
+    # will not be necessary for any other job
+    - key:
+        ${CI_JOB_NAME}
+        # must be inside $CI_PROJECT_DIR for gitlab-runner caching (#3)
+      paths:
+        - .npm/
+      when: on_success
+      policy: pull-push
+
+  # Секция со скриптами.
+  script:
+    # На всякий случай выведем версии node и npm для визуального контроля.
+    - node --version
+    - npm --version
+
+    # "npm ci" игнорирует package.json пакета и устанавливает модули
+    # руководствуясь локфайлом (package-lock.json).
+    # Это позволяет создавать воспроизводимые сборки: вы получаете именно то,
+    # что ожидаете при каждой установке.
+    # Подробнее: https://habr.com/ru/articles/350762/
+    - npm ci --prefer-offline --audit false --cache .npm
+
+# Шаблон для джобы запуска тестов
+.test base:
+  # Этап тестирования.
+  stage: orders
+  when: manual
+
+  # У PW есть свой образ.
+  image: ${PLAYWRIGHT_IMAGE}
+
+  tags: [tests, k8s]
+
+  # Таймаут этапа
+  timeout: 10m
+
+  # Разрешим джобе тестов падать и не фейлить нам весь пайплайн
+  allow_failure: true
+
+  variables:
+    # Каждый запуск тестов при загрузке в Аллюр будет отражаться так, как мы укажем тут:
+    ALLURE_LAUNCH_NAME: "${CI_PROJECT_NAME} - ${CI_COMMIT_BRANCH} - ${CI_COMMIT_SHORT_SHA}"
+    ALLURE_LAUNCH_TAGS: ui,e2e,${CI_COMMIT_REF_NAME}
+    ALLURE_TESTPLAN_PATH: "testplan.json"
+    VAULT_ADDR: https://vault.s.o3.ru:8200
+    VAULT_ROLE: ro-stg-common
+
+  before_script:
+    - export VAULT_TOKEN="$(curl -sS -X PUT -d '{"jwt":"'$CI_JOB_JWT'","role":"'$VAULT_ROLE'"}' $VAULT_ADDR/v1/auth/jwt/login | sed 's/.*"client_token":"\([^"]\+\)".*/\1/')"
+  script:
+    # Выведем меш для проверки
+    - echo "MESHVERSION ${OVERRIDE_MESHVERSION}"
+  
+    - allurectl job-run plan --output-file ${ALLURE_TESTPLAN_PATH}
+    - allurectl watch --results ${REPORT_PATH} -- npx playwright test --retries=2 --project=${TEST_PROJECT_NAME} ${PW_RUN_ARGS}
+
+
+  # Всегда сохраняем артефакты и храним их 2 недели.
+  artifacts:
+    when: always
+    paths:
+      - testplan.json
+      - ${REPORT_PATH}
+      - trace.zip
+    expire_in: 2 weeks
+    reports:
+      junit: junit.xml
+
+.fe lint:
+  image: "${BASE_IMAGE_REPO}/docker/nodejs/base:18"
+  tags: [tests, k8s]
+  needs:
+    - install
+  except:
+    - api
+    - web
+    - schedules
+    - tags
+    - pipelines
+    - triggers
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - "**/node_modules/"
+    policy: pull
+  stage: build
+  variables:
+    NODE_ENV: development
+
+typescript:
+  extends: ".fe lint"
+  script:
+    - npx tsc
+
+eslint:
+  extends: ".fe lint"
+  script:
+    - npx eslint --config ./node_modules/@fe/eslint-config/index.js --resolve-plugins-relative-to
+      ./node_modules/@fe/eslint-config --ext .js,.ts,.tsx .
+
+basic Filter Tests:
+  extends: .test base
+  variables:
+    TEST_PROJECT_NAME: BasicFilters
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+additional Filter Tests:
+  extends: .test base
+  variables:
+    TEST_PROJECT_NAME: AdditionalFilters
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+approving Orders Tests:
+  extends: .test base
+  variables:
+    TEST_PROJECT_NAME: ApproveWithError
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+availability Actions With Orders:
+  extends: .test base
+  variables:
+    TEST_PROJECT_NAME: ActionsWithOrders
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+adjustment Orders:
+  extends: .test base
+  variables:
+    TEST_PROJECT_NAME: AdjustmentOrders
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+intermediate supplier Events Tests:
+  extends: .test base
+  variables:
+    TEST_PROJECT_NAME: IntermediateSupplierEvents
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+final supplier Events Tests:
+  extends: .test base
+  variables:
+    TEST_PROJECT_NAME: FinalSupplierEvents
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+Information Curtain Tests:
+  extends: .test base
+  variables:
+    TEST_PROJECT_NAME: InformationCurtains
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+creatre Super Economy Order Tests:
+  extends: .test base
+  variables:
+    TEST_PROJECT_NAME: SuperEconomyOrder
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+split And Merge Orders Tests:
+  extends: .test base
+  variables:
+    TEST_PROJECT_NAME: SplitAndMergeOrders
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+return To Moderation Tests:
+  extends: .test base
+  variables:
+    TEST_PROJECT_NAME: ReturnToModeration
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+download reports Tests:
+  extends: .test base
+  variables:
+    TEST_PROJECT_NAME: ExcelReports
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+budget Tests:
+  extends: .test base
+  stage: budget
+  variables:
+    TEST_PROJECT_NAME: BudgetTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+reserved orders budget Tests:
+  extends: .test base
+  stage: budget
+  variables:
+    TEST_PROJECT_NAME: ReserveBudgetTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+archive matching Tests:
+  extends: .test base
+  stage: archive
+  variables:
+    TEST_PROJECT_NAME: OrdersArchive
+  except:
+    variables:
+    - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+archive excel reports executed orders Tests:
+  extends: .test base
+  stage: archive
+  variables:
+    TEST_PROJECT_NAME: OrdersArchiveExcelReportsExecuted
+  except:
+    variables:
+    - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+archive excel reports cancelled orders Tests:
+  extends: .test base
+  stage: archive
+  variables:
+    TEST_PROJECT_NAME: OrdersArchiveExcelReportsCancelled
+  except:
+    variables:
+    - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+archive Filters Tests:
+  extends: .test base
+  stage: archive
+  variables:
+    TEST_PROJECT_NAME: ArchiveFiltersTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+express orders Tests:
+  extends: .test base
+  stage: express
+  variables:
+    TEST_PROJECT_NAME: ExpressOrdersSignUp
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+capasitets checking Tests:
+  extends: .test base
+  stage: express
+  variables:
+    TEST_PROJECT_NAME: CapasitetsCheckingTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+eams adjustment Tests:
+  extends: .test base
+  stage: express
+  variables:
+    TEST_PROJECT_NAME: EAMSAdjustmentTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+slots checking Test:
+  extends: .test base
+  stage: express
+  variables:
+    TEST_PROJECT_NAME: EAMSslotsCheckingTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+fmcg rounding creation without supplier Tests:
+  extends: .test base
+  stage: supereconom2
+  variables:
+    TEST_PROJECT_NAME: CreationFMCGWithoutSupplierRoundingTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+not fmcg rounding creation without supplier Tests:
+  extends: .test base
+  stage: supereconom2
+  variables:
+    TEST_PROJECT_NAME: CreationNotFMCGWithoutSupplierRoundingTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+fmcg rounding creation with supplier Tests:
+  extends: .test base
+  stage: supereconom2
+  variables:
+    TEST_PROJECT_NAME: CreationFMCGWithSupplierRoundingTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+not fmcg rounding creation with supplier Tests:
+  extends: .test base
+  stage: supereconom2
+  variables:
+    TEST_PROJECT_NAME: CreationNotFMCGWithSupplierRoundingTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+fmcg rounding creation regional Tests:
+  extends: .test base
+  stage: supereconom2
+  variables:
+    TEST_PROJECT_NAME: CreationFMCGWRoundingRegionalTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+not fmcg rounding creation regional Tests:
+  extends: .test base
+  stage: supereconom2
+  variables:
+    TEST_PROJECT_NAME: CreationNotFMCGWRoundingRegionalTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+not fmcg rounding adjustment without supplier Tests:
+  extends: .test base
+  stage: supereconom2
+  variables:
+    TEST_PROJECT_NAME: AdjustmentNotFMCGWRoundingWithoutSupplierTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+not fmcg rounding adjustment with supplier Tests:
+  extends: .test base
+  stage: supereconom2
+  variables:
+    TEST_PROJECT_NAME: AdjustmentNotFMCGWRoundingWithSupplierTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+fmcg rounding adjustment with supplier Tests:
+  extends: .test base
+  stage: supereconom2
+  variables:
+    TEST_PROJECT_NAME: AdjustmentFMCGWRoundingWithSupplierTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+fmcg rounding adjustment without supplier Tests:
+  extends: .test base
+  stage: supereconom2
+  variables:
+    TEST_PROJECT_NAME: AdjustmentFMCGWRoundingWithoutSupplierTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+fmcg rounding adjustment regional Tests:
+  extends: .test base
+  stage: supereconom2
+  variables:
+    TEST_PROJECT_NAME: AdjustmentFMCGWRoundingRegionalTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+not fmcg rounding adjustment regional Tests:
+  extends: .test base
+  stage: supereconom2
+  variables:
+    TEST_PROJECT_NAME: AdjustmentNotFMCGWRoundingRegionalTest
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+
+filters preset Tests:
+  extends: .test base
+  variables:
+    TEST_PROJECT_NAME: FiltersPresetTests
+  except:
+    variables:
+      - $SERVICE_NAME == "--project=${TEST_PROJECT_NAME}"
+  
+# Грузим наши результаты в старый добрый обычный Аллюр
+# и отправляем отчёт в маттермост. Обычный старый Аллюр будто стабильнее,
+# и точно лучше отображает результаты PW, разбивая их на девайсы.
+# В постскрипте можно найти вызов специального сервиса, который пришлёт ещё один отчёт в ММ,
+# но только красивый. :) Да, нам будет прилетать два отчёта.
+tests report:
+  # Пусть это будет завершающий этап.
+  stage: .post
+  image: ${PLAYWRIGHT_IMAGE}
+  tags: [tests, k8s]
+  when: manual
+
+  # Разрешим отправке сообщения в маттермост падать и не фейлить нам весь пайплайн:
+  allow_failure: false
+  cache: []
+
+  # Всегда сохраняем артефакты и храним их неделю.
+  artifacts:
+    when: always
+    paths:
+      - allure_results.zip
+    expire_in: 1 week
+
+  script:
+    # Архивируем результаты запуска тестов в allure_results.zip
+    - |
+      if [ -d "${REPORT_PATH}" ]
+      then
+        echo "zipping allure results from ${REPORT_PATH} to $(pwd)/allure_results.zip"
+        zip -j -qr allure_results.zip ${REPORT_PATH}/*
+      else
+        echo "Folder ${REPORT_PATH} does not exist."
+      fi
+    # Загружаем архив allure_results.zip в старый Аллюр, вычисляем переменную OZALLURE_REPORT_URL для отчета MM
+    - |
+      if [ -f "allure_results.zip" ]
+        then
+          echo "Upload report to ${ALLURE_ENDPOINT}..."
+          OZALLURE_REPORT_URL=$(curl -sS -F file=@allure_results.zip "${ALLURE_ENDPOINT}/upload?group=${CI_PROJECT_NAMESPACE}&project=${CI_PROJECT_NAME}&version=${CI_COMMIT_REF_NAME}" || true)
+          if [[ ${OZALLURE_REPORT_URL} =~ https://allure\.s\.o3\.ru.* ]]
+            then
+              echo "Upload to ${ALLURE_ENDPOINT}... complete!"
+              echo "You can check report at ${OZALLURE_REPORT_URL}"
+            else
+              echo "Upload was not finished properly."
+              echo "ozallure response ${OZALLURE_REPORT_URL}"
+          fi
+        else
+          echo "No zip file to upload in $(pwd)!"
+          echo "But we found:"
+          echo "$(ls)"
+      fi
+    # Вычисляем и экспортируем переменные: ALLURE_LAUNCH_ID, TESTOPS_REPORT_URL
+    - export $(allurectl job-run env | grep ALLURE | xargs -L1)
+    - |
+      if ! [ -z ${ALLURE_LAUNCH_ID} ]
+      then
+        export TESTOPS_REPORT_URL=${ALLURE_ENDPOINT}/launch/${ALLURE_LAUNCH_ID}
+        echo "TESTOPS_REPORT_URL=${TESTOPS_REPORT_URL}"
+        echo "ALLURE_PROJECT_URL=${ALLURE_ENDPOINT}/project/${ALLURE_PROJECT_ID}/launches"
+      else
+        echo "Uploading to TestOps was not finished properly"
+        echo "Please, check job artifacts to get your allure-results."
+      fi
+  
+    # Отправляем инфу о запуске тестов в сервис отчётов, который пришлёт нам красивый отчёт в ММ
+    - |-
+      PAYLOAD_BASE=$(cat << JSON
+      {
+        "allure_testops_url": "$TESTOPS_REPORT_URL",
+        "allure_url": "$OZALLURE_REPORT_URL",
+        "project_id": "$CI_PROJECT_ID",
+        "job_id": "$CI_JOB_ID",
+        "service_name": "$SERVICE_NAME",
+        "message_customization": {
+          "bonus_header": ":gitlab: [#$CI_PIPELINE_ID]($CI_PIPELINE_URL) :git: $MM_CI_COMMIT_REF_NAME :cat-roomba::cat-roomba::cat-roomba:"
+        }
+      }
+      JSON
+      )
+    - |-
+      PAYLOAD_EXTENTED=$(cat << JSON
+      {
+        "allure_testops_url": "$TESTOPS_REPORT_URL",
+        "allure_url": "$OZALLURE_REPORT_URL",
+        "project_id": "$CI_PROJECT_ID",
+        "job_id": "$CI_JOB_ID",
+        "service_name": "$SERVICE_NAME",
+        "message_customization": {
+          "bonus_header": ":gitlab: [#$CI_PIPELINE_ID]($CI_PIPELINE_URL) :git: $MM_CI_COMMIT_REF_NAME :peeporun::peeporun::peeporun:",
+          "bonus_info": [
+            "**$SERVICE_NAME:**",
+            ":gitlab: **Пайплайн:** [#$MM_CI_PIPELINE_ID]($MM_CI_PIPELINE_URL)",
+            ":git: **Ветка:** [$MM_CI_COMMIT_REF_NAME](https://gitlab.ozon.ru/internal-projects/$SERVICE_NAME/-/tree/$MM_CI_COMMIT_REF_NAME)",
+            ":git: **Коммит:** [$MM_CI_COMMIT_SHORT_SHA](https://gitlab.ozon.ru/internal-projects/$SERVICE_NAME/-/commit/$MM_CI_COMMIT_SHORT_SHA) $MM_CI_COMMIT_MESSAGE",
+            ":git: **Автор:** $MM_CI_COMMIT_AUTHOR"
+          ]
+        }
+      }
+      JSON
+      )
+    - |
+      if [ "$SERVICE_NAME" == "orders" ]
+      then
+        export PAYLOAD="${PAYLOAD_BASE}"
+      else
+        export PAYLOAD="${PAYLOAD_EXTENTED}"
+      fi
+    - echo "${PAYLOAD}"
+    - |
+      echo "Sending request to report service..."
+      echo "Response:"
+    - >
+      echo $(curl -X POST "${REPORT_SERVICE_HOST}/report-api/create-task"
+      -sS --fail --retry 5 --retry-all-errors --retry-delay 5
+      -H "accept: application/json"
+      -H "Content-Type: application/json"
+      --data-binary "${PAYLOAD//$'\n'/}")
+    # Экспортируем данные запуска в тикет jit (секция Allure: Launches), который берется из названия текущей ветки git
+    - integration_id=1
+    - >
+      access_token=$(curl -X POST "${ALLURE_ENDPOINT}/api/uaa/oauth/token"
+      -sS --fail --retry 5 --retry-all-errors --retry-delay 5
+      -H "Content-Type:application/x-www-form-urlencoded"
+      -d "scope=openid&token=${ALLURE_TOKEN}&grant_type=apitoken"
+      | sed 's/.*"access_token":"\{0,1\}\([^,"]*\)"\{0,1\}.*/\1/')
+    - jit_task="$(echo $CI_COMMIT_REF_NAME | cut -d '/' -f 2 | cut -d '-' -f 1,2 | cut -d '_' -f 1)"
+    - echo "Attaching allure launch ${ALLURE_LAUNCH_ID} to jit task \"${jit_task}\""
+    - >
+      echo $(curl -X POST "${ALLURE_ENDPOINT}/api/rs/launch/${ALLURE_LAUNCH_ID}/issue/export"
+      -sS --fail --retry 5 --retry-all-errors --retry-delay 5
+      -H "Content-Type: application/json"
+      -H "Authorization:Bearer ${access_token}"
+      -d "[{\"name\":\"${jit_task}\", \"integrationId\":${integration_id}}]")
