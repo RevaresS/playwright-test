@@ -32,14 +32,4 @@ export default defineConfig({
 			fullPage: false,
 		},
 	},
-	reporter: [
-		['dot'],
-		['junit', { outputFile: 'junit.xml' }],
-		['allure-playwright', {
-			outputFolder: 'allure-results',
-			environmentInfo: {
-				OVERRIDE_MESHVERSION: process.env.OVERRIDE_MESHVERSION?.replace('internal-projects', 'oprofit'),
-			},
-		}],
-	],
 })
